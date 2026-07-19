@@ -2152,6 +2152,169 @@ int cmdBlackboardTail() {
     return 2;
 }
 
+// ─── self-model (phase 9): privacy scrubber, curator, adapter registry ────
+//
+// These wrap already-shipped library code (PrivacyFilter, TrainingCurator,
+// AdapterRegistry) that the help text advertised but the dispatcher never
+// reached — `arise self ...` used to print "unknown command: self".
+
+static std::string fmtTp(std::chrono::system_clock::time_point tp) {
+    if (tp.time_since_epoch().count() == 0) return "-";
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm_buf{}; localtime_r(&t, &tm_buf);
+    char buf[24]; std::strftime(buf, sizeof buf, "%F %T", &tm_buf);
+    return buf;
+}
+
+int cmdSelfPrivacyCheck(const Args& a) {
+    std::string text;
+    if (a.has("file")) {
+        text = slurp(a.get("file"));
+        if (text.empty()) {
+            std::cerr << "self privacy-check: --file empty or unreadable\n";
+            return 2;
+        }
+    } else if (a.has("text")) {
+        text = a.get("text");
+    } else {
+        std::cerr << "self privacy-check: --text T or --file F required\n";
+        return 2;
+    }
+
+    arise::PrivacyFilter filter{arise::PrivacyFilter::Config{}};
+    auto res = filter.scan(text);
+
+    json out;
+    out["passed"]    = res.passed;           // true ⇒ nothing sensitive found
+    out["hit_count"] = res.hits.size();
+    json hits = json::array();
+    for (const auto& h : res.hits) {
+        hits.push_back({
+            {"reason",  arise::PrivacyFilter::reasonToString(h.reason)},
+            {"start",   h.start},
+            {"length",  h.length},
+            {"preview", h.preview},
+        });
+    }
+    out["hits"]     = hits;
+    out["redacted"] = res.redacted_text;
+    std::cout << out.dump(2) << "\n";
+    // Non-zero exit when something sensitive was found, so scripts can gate.
+    return res.passed ? 0 : 1;
+}
+
+int cmdSelfCurate(const Args& a) {
+    arise::TrainingCurator::Config cfg;
+    if (a.has("lookback-hours"))
+        cfg.replay.lookback =
+            std::chrono::hours(std::atoi(a.get("lookback-hours").c_str()));
+    if (a.has("top-n"))
+        cfg.top_n = std::atoi(a.get("top-n").c_str());
+    if (a.flag.count("no-llm"))
+        cfg.skip_llm_scoring = true;
+    if (const char* u = std::getenv("ARIA_OLLAMA_URL"))
+        cfg.scorer.ollama_url = u;
+
+    arise::MemoryCortex cortex(defaultCortexConfig());
+    arise::FeedbackDb   feedback(defaultFeedbackCfg());
+
+    arise::TrainingCurator curator(cfg);
+    arise::TrainingCurator::Stats stats;
+    auto examples = curator.curate(cortex, feedback, &stats);
+
+    // --out is an output directory (writeJsonl names the file <slug>.jsonl).
+    std::string dir = a.has("out") ? a.get("out") : arise::paths::trainingDir();
+    std::string path;
+    if (!examples.empty())
+        path = arise::TrainingCurator::writeJsonl(examples, dir);
+
+    json out;
+    out["replayed_total"]    = stats.replayed_total;
+    out["scored"]            = stats.scored;
+    out["dropped_low_score"] = stats.dropped_low_score;
+    out["dropped_privacy"]   = stats.dropped_privacy;
+    out["dropped_empty"]     = stats.dropped_empty;
+    out["kept"]              = stats.kept;
+    out["written"]           = path;   // empty if nothing kept
+    std::cout << out.dump(2) << "\n";
+    return 0;
+}
+
+int cmdSelfAdapter(const Args& a) {
+    if (a.pos.empty()) {
+        std::cerr << "self adapter: subcommand required "
+                     "(list|register|promote|rollback|rotate)\n";
+        return 2;
+    }
+    std::string sub = a.pos[0];
+
+    arise::AdapterRegistry::Config cfg;
+    cfg.manifest_path = arise::paths::adaptersManifestPath();
+    if (a.has("keep")) cfg.keep = std::atoi(a.get("keep").c_str());
+    arise::AdapterRegistry reg(cfg);
+    reg.load();
+
+    auto infoToJson = [](const arise::AdapterInfo& i) {
+        return json{
+            {"id",             i.id},
+            {"base_model",     i.base_model},
+            {"path",           i.path},
+            {"eval_score",     i.eval_score},
+            {"baseline_score", i.baseline_score},
+            {"deployed",       i.deployed},
+            {"rolled_back",    i.rolled_back},
+            {"created_at",     fmtTp(i.created_at)},
+            {"evaluated_at",   fmtTp(i.evaluated_at)},
+            {"note",           i.note},
+        };
+    };
+
+    if (sub == "list") {
+        json arr = json::array();
+        for (const auto& i : reg.list()) arr.push_back(infoToJson(i));
+        std::cout << arr.dump(2) << "\n";
+        return 0;
+    }
+    if (sub == "register") {
+        if (!a.has("id") || !a.has("path") || !a.has("base-model")) {
+            std::cerr << "self adapter register: --id, --path and "
+                         "--base-model are required\n";
+            return 2;
+        }
+        arise::AdapterInfo info;
+        info.id             = a.get("id");
+        info.path           = a.get("path");
+        info.base_model     = a.get("base-model");
+        info.eval_score     = a.has("score") ? std::atof(a.get("score").c_str()) : 0.0;
+        info.note           = a.get("note");
+        if (!reg.registerAdapter(info)) {
+            std::cerr << "self adapter register: failed to save manifest\n";
+            return 1;
+        }
+        std::cout << "registered " << info.id << "\n";
+        return 0;
+    }
+    if (sub == "promote" || sub == "rollback") {
+        if (a.pos.size() < 2) {
+            std::cerr << "self adapter " << sub << ": ID required\n";
+            return 2;
+        }
+        std::string id = a.pos[1];
+        bool ok = (sub == "promote") ? reg.promote(id) : reg.rollback(id);
+        if (!ok) { std::cerr << "self adapter " << sub << ": no such id '" << id << "'\n"; return 1; }
+        std::cout << sub << " " << id << " ok\n";
+        return 0;
+    }
+    if (sub == "rotate") {
+        int archived = reg.rotate();
+        std::cout << "rotated: archived " << archived
+                  << " adapter(s), keeping " << cfg.keep << "\n";
+        return 0;
+    }
+    std::cerr << "self adapter: unknown subcommand '" << sub << "'\n";
+    return 2;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2277,6 +2440,16 @@ int main(int argc, char** argv) {
         Args sa = a; sa.pos.erase(sa.pos.begin());
         if (sub == "absorb") return cmdCuratorAbsorb(sa);
         std::cerr << "curator: unknown subcommand '" << sub << "'\n";
+        return 2;
+    }
+    if (cmd == "self") {
+        if (a.pos.empty()) { std::cerr << "self: subcommand required\n"; return 2; }
+        std::string sub = a.pos[0];
+        Args sa = a; sa.pos.erase(sa.pos.begin());
+        if (sub == "curate")        return cmdSelfCurate(sa);
+        if (sub == "privacy-check") return cmdSelfPrivacyCheck(sa);
+        if (sub == "adapter")       return cmdSelfAdapter(sa);
+        std::cerr << "self: unknown subcommand '" << sub << "'\n";
         return 2;
     }
 

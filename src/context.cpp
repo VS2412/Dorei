@@ -71,7 +71,13 @@ SystemContext Context::capture() {
 
     auto [app, win] = niriF.get();
     ctx.activeApp    = app;
-    ctx.activeWindow = win;
+    // For terminal apps the window title is almost always the running
+    // shell command ("cd ~/foo; systemctl restart ai-agent;...") which is
+    // pure noise to the LLM — and worse, the LLM tends to read it as if
+    // it were user intent. The activeApp ("alacritty"/"org.gnome.Console")
+    // already conveys "user is at a terminal", so drop the title in that
+    // case rather than injecting shell history into every prompt.
+    ctx.activeWindow = isTerminalApp(app) ? std::string{} : win;
 
     std::future<std::string> screenF;
     bool ocrSkipped = false;

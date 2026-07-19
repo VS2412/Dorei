@@ -22,6 +22,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -31,6 +34,72 @@
 
 Daemon::Daemon(std::atomic<bool>& flag, std::atomic<bool>& pause)
     : shutdownRequested(flag), pauseToggle(pause) {}
+
+// ─── Phase 0 instrumentation ───
+
+long long Daemon::nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Emit the single per-turn budget line. Convention: a stage that didn't run
+// is omitted; `first_audio_ms` is speech-end → first piper spawn (the KPI),
+// `turn_total_ms` additionally includes full TTS playback + settle.
+void Daemon::logTurn(const std::string& text) {
+    nlohmann::json j;
+    std::string t = text.substr(0, 80);
+    j["text"]    = t;
+    j["path"]    = turn_.path.empty() ? "unknown" : turn_.path;
+    if (!turn_.outcome.empty()) j["outcome"] = turn_.outcome;
+    if (turn_.asrDone)    j["asr_ms"]  = turn_.asrDone - turn_.speechEnd;
+    if (turn_.ctxDone)    j["ctx_ms"]  = turn_.ctxDone - turn_.asrDone;
+    if (turn_.firstToken) j["ttft_ms"] = turn_.firstToken - turn_.llmStart;
+    if (turn_.llmDone)    j["llm_ms"]  = turn_.llmDone - turn_.llmStart;
+    if (tts_) {
+        long long ttsStart = tts_->lastSpeakStartMs();
+        if (ttsStart >= turn_.speechEnd)
+            j["first_audio_ms"] = ttsStart - turn_.speechEnd;
+    }
+    j["turn_total_ms"] = nowMs() - turn_.speechEnd;
+    Logger::info("TURN " + j.dump());
+}
+
+// Copy the utterance WAV + its transcript into the bench corpus so the ASR
+// bench can score against the user's real voice. 16kHz mono s16le, ~32KB/s,
+// keep-last-200 → worst case ~130MB, typically far less.
+void Daemon::maybeArchiveUtterance(const std::string& wavPath,
+                                   const std::string& text) {
+    if (!benchCapture_) return;
+    namespace fs = std::filesystem;
+    try {
+        const char* home = std::getenv("HOME");
+        if (!home) return;
+        fs::path dir = fs::path(home) / ".local/share/aria/bench_corpus";
+        fs::create_directories(dir);
+
+        std::string name = "turn_" + std::to_string(nowMs()) + ".wav";
+        fs::copy_file(wavPath, dir / name,
+                      fs::copy_options::overwrite_existing);
+
+        std::string clean = text;
+        for (char& c : clean)
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        std::ofstream mf(dir / "manifest.tsv", std::ios::app);
+        mf << name << '\t' << clean << '\n';
+
+        // Rotation: epoch-ms names sort lexicographically == chronologically.
+        std::vector<fs::path> wavs;
+        for (auto& e : fs::directory_iterator(dir))
+            if (e.path().extension() == ".wav") wavs.push_back(e.path());
+        if (wavs.size() > 200) {
+            std::sort(wavs.begin(), wavs.end());
+            for (size_t i = 0; i + 200 < wavs.size(); ++i)
+                fs::remove(wavs[i]);
+        }
+    } catch (const std::exception& e) {
+        Logger::warn(std::string("Corpus capture failed: ") + e.what());
+    }
+}
 
 // ─── Static helpers (unchanged from v2) ───
 
@@ -312,6 +381,13 @@ std::string Daemon::executeAction(const AgentAction& act) {
 
 // ─── Phase 11: planner glue ───
 
+void Daemon::unmuteAfterSettle(std::chrono::milliseconds settle) {
+    if (!recorder_) return;
+    if (settle.count() > 0)
+        std::this_thread::sleep_for(settle);
+    recorder_->unmute();
+}
+
 // Pop the next transcribed speech segment off the shared queue, with a
 // bounded wait. Used by the confirmation gate. Returns the transcribed text
 // (possibly empty on VAD noise) or "" on timeout.
@@ -325,7 +401,7 @@ std::string Daemon::pollNextText(std::chrono::milliseconds timeout) {
             return "";  // timed out
         }
         if (shutdownRequested.load() || speechQueue_.empty()) return "";
-        wavPath = speechQueue_.front();
+        wavPath = speechQueue_.front().wavPath;
         speechQueue_.pop();
     }
     if (!transcriber_) return "";
@@ -391,7 +467,7 @@ void Daemon::runPlannerGoal(const std::string& goal, const LLMContext& ctx) {
         {
             std::unique_lock<std::mutex> lock(qMutex_);
             if (speechQueue_.empty()) return false;
-            wavPath = speechQueue_.front();
+            wavPath = speechQueue_.front().wavPath;
             speechQueue_.pop();
         }
         if (wavPath.empty() || !transcriber_) return false;
@@ -616,6 +692,7 @@ void Daemon::processUtterance(const std::string& rawText) {
         // (running on a worker thread) exits at its next check.
         abortRequested_.store(true);
         Logger::info("ARIA: interrupted by voice — '" + text + "'");
+        turn_.path = "interrupt";
         return;
     }
 
@@ -635,6 +712,7 @@ void Daemon::processUtterance(const std::string& rawText) {
                 tts_->speak("Yes?");
                 recorder_->unmute();
                 Logger::info("Wake: acknowledged, awaiting follow-up.");
+                turn_.path = "wake_ack";
                 return;
             }
             Logger::info("Wake: activated → " + text);
@@ -643,6 +721,7 @@ void Daemon::processUtterance(const std::string& rawText) {
             Logger::info("Wake: follow-up accepted.");
         } else {
             Logger::info("Wake: asleep, ignored: " + text);
+            turn_.path = "asleep";
             return;
         }
     }
@@ -690,6 +769,7 @@ void Daemon::processUtterance(const std::string& rawText) {
 
     if (directAction.empty() && wordCount(text) <= 2) {
         Logger::info("Skipped short utterance: " + text);
+        turn_.path = "skip";
         return;
     }
 
@@ -697,17 +777,20 @@ void Daemon::processUtterance(const std::string& rawText) {
 
     if (!directAction.empty()) {
         Logger::info("Intent: " + directAction.type + " → " + directAction.args.dump());
+        turn_.path    = "intent";
+        turn_.outcome = directAction.type;
         std::string feedback = executeAction(directAction);
         memory_->save("user", text);
         memory_->save("assistant", directAction.type + ":" + directAction.args.dump());
         if (!feedback.empty()) tts_->speak(feedback);
-        recorder_->unmute();
+        unmuteAfterSettle();
         maybeSummarize();
         return;
     }
 
     // Unknown command → LLM path.
     auto sysCtx = Context::capture();
+    turn_.ctxDone = nowMs();
     Logger::info("Context: app=" + sysCtx.activeApp + " window=" + sysCtx.activeWindow);
 
     // Fast-path direct context queries — avoid the LLM round-trip.
@@ -728,10 +811,12 @@ void Daemon::processUtterance(const std::string& rawText) {
     }
     if (!directAnswer.empty()) {
         Logger::info("Context query → " + directAnswer);
+        turn_.path    = "context";
+        turn_.outcome = "speech";
         memory_->save("user", text);
         memory_->save("assistant", directAnswer);
         tts_->speak(directAnswer);
-        recorder_->unmute();
+        unmuteAfterSettle();
         maybeSummarize();
         return;
     }
@@ -740,10 +825,12 @@ void Daemon::processUtterance(const std::string& rawText) {
     // on phrases like "you're ready to go" (was calling system_info).
     if (const char* reply = matchSmallTalk(text)) {
         Logger::info("Small-talk fast-path: \"" + text + "\" → " + reply);
+        turn_.path    = "smalltalk";
+        turn_.outcome = "speech";
         memory_->save("user", text);
         memory_->save("assistant", reply);
         tts_->speak(reply);
-        recorder_->unmute();
+        unmuteAfterSettle();
         return;
     }
 
@@ -755,7 +842,8 @@ void Daemon::processUtterance(const std::string& rawText) {
             Logger::error("LLM: still unreachable, giving up on this utterance");
             memory_->save("user", text);
             tts_->speak("I'm offline right now, try again in a moment.");
-            recorder_->unmute();
+            turn_.path = "llm_offline";
+            unmuteAfterSettle();
             return;
         }
     }
@@ -781,15 +869,32 @@ void Daemon::processUtterance(const std::string& rawText) {
         prompt = text + " (user's name is " + userName + ")";
 
     // Streaming LLM → Streaming TTS
+    turn_.path     = "llm";
+    turn_.llmStart = nowMs();
     tts_->startStream();
     auto response = llm_->thinkStreaming(prompt, ctx,
-        [this](const std::string& delta) { tts_->feedChunk(delta); });
+        [this](const std::string& delta) {
+            if (!turn_.firstToken) turn_.firstToken = nowMs();
+            tts_->feedChunk(delta);
+        });
+    turn_.llmDone = nowMs();
+    if (response.hasAction()) {
+        std::string types;
+        for (auto& a : response.actions)
+            types += (types.empty() ? "" : ",") + a.type;
+        turn_.outcome = "tool:" + types;
+    } else {
+        turn_.outcome = "speech";
+    }
 
     memory_->save("user", text);
 
     handleLLMResponse(response, ctx, text);
 
-    recorder_->unmute();
+    // Settle window: TTS just finished; speaker→mic echo can persist for
+    // a few hundred ms (room reverb + playback buffer drain). Keep the mic
+    // muted through it so we don't immediately re-trigger on our own voice.
+    unmuteAfterSettle();
     maybeSummarize();
 }
 
@@ -827,15 +932,20 @@ void Daemon::run() {
     Recorder recorder("/tmp/aria_speech.wav",
         [this](const std::string& wavPath) {
             std::lock_guard<std::mutex> lock(qMutex_);
-            speechQueue_.push(wavPath);
+            speechQueue_.push({wavPath, nowMs()});
             qCV_.notify_one();
         });
     recorder_ = &recorder;
+
+    // Phase 0: corpus capture opt-out.
+    if (const char* v = std::getenv("ARIA_BENCH_CAPTURE"))
+        benchCapture_ = !(std::string(v) == "0" || std::string(v) == "false");
 
     TimerManager timers([&tts, &recorder](const std::string& label) {
         recorder.mute();
         tts.speak("Timer done: " + label);
         system(("notify-send 'ARIA Timer' " + std::string("'") + label + "'").c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         recorder.unmute();
     });
     timers_ = &timers;
@@ -874,6 +984,7 @@ void Daemon::run() {
             } else {
                 tts.speak("Yes?");
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             recorder.unmute();
         }).detach();
     };
@@ -888,11 +999,6 @@ void Daemon::run() {
         Logger::info("Wake-word: disabled (always-on listening).");
     }
 
-    // Phase 10: non-blocking VLM prewarm. Pushes moondream into Ollama's
-    // resident set in the background so the first real see_screen call
-    // doesn't eat the 3–5 s model-swap penalty.
-    Vision::prewarm();
-
     // Text-prefix wake (legacy) stays useful when audio wake is off and the
     // user still wants a command gate. With audio wake active, the recorder
     // already gates so text check is a no-op.
@@ -906,13 +1012,34 @@ void Daemon::run() {
             qCV_.wait_for(lock, std::chrono::milliseconds(100),
                 [&]{ return !speechQueue_.empty() || shutdownRequested.load(); });
             if (speechQueue_.empty()) continue;
-            std::string wavPath = speechQueue_.front();
+            QueuedWav qw = speechQueue_.front();
             speechQueue_.pop();
             lock.unlock();
+            const std::string& wavPath = qw.wavPath;
 
             if (!ariaActive_.load()) continue;
 
+            turn_.reset();
+            turn_.speechEnd = qw.enqueuedMs;
+
+            // Echo guard: if TTS is still speaking, or finished <1500ms ago,
+            // this WAV is almost certainly speaker→mic feedback of ARIA's
+            // own voice. Drop it without burning transcribe latency. The
+            // 1.5s window covers the typical capture→queue→pop lag plus
+            // post-playback room reverb; cost is dropping legitimate user
+            // speech in the first 1.5s after ARIA finishes, which is rare.
+            if (tts.wasRecentlySpeaking(1500)) {
+                Logger::info("VAD: dropping likely-echo segment (TTS just spoke "
+                             + std::to_string(tts.msSinceLastSpeech()) + " ms ago).");
+                // Traced: these are exactly where fast user replies get
+                // eaten today. Phase 3 (AEC) must drive this count to zero.
+                turn_.path = "echo_drop";
+                logTurn("");
+                continue;
+            }
+
             std::string text = transcriber.transcribe(wavPath);
+            turn_.asrDone = nowMs();
 
             // After 3 consecutive whisper failures, tell the user something's
             // wrong — before that we stay silent to avoid spamming on misreads.
@@ -930,8 +1057,10 @@ void Daemon::run() {
                 continue;
             }
             Logger::info("You said: " + text);
+            maybeArchiveUtterance(wavPath, text);
 
             processUtterance(text);
+            logTurn(text);
         }
     });
 
@@ -942,6 +1071,7 @@ void Daemon::run() {
     recorder.mute();
     auto userName = memory.getFact("user_name");
     tts.speak(userName.empty() ? "Online." : "Online, " + userName + ".");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     recorder.unmute();
 
     Logger::info("ARIA ready.");
@@ -958,7 +1088,7 @@ void Daemon::run() {
             abortRequested_.store(true);
             {
                 std::lock_guard<std::mutex> lock(qMutex_);
-                std::queue<std::string> empty;
+                std::queue<QueuedWav> empty;
                 speechQueue_.swap(empty);
             }
             qCV_.notify_all();

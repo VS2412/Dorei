@@ -239,6 +239,35 @@ std::string Executor::execute(const AgentAction& action) {
         else if (p == "stop")  system("playerctl stop");
         return "";
     }
+    if (action.type == "play_music") {
+        // Start music from cold. Defaults to YouTube Music — works without
+        // a Spotify install, opens in the user's default browser (firefox).
+        // If the user gives a query, URL-encode it via jq -sRr @uri.
+        std::string query = arg(action.args, "query");
+        std::string url;
+        if (query.empty()) {
+            url = "https://music.youtube.com/";
+        } else {
+            // Conservative URL encoding via printf "%s" piped through jq.
+            // Falls back to raw query if jq isn't installed (most arch
+            // installs have it via nlohmann-json dep chain, but be safe).
+            std::string enc;
+            FILE* f = popen(("printf '%s' " + q(query) +
+                             " | jq -sRr @uri 2>/dev/null").c_str(), "r");
+            if (f) {
+                char buf[512] = {};
+                fread(buf, 1, sizeof(buf) - 1, f);
+                pclose(f);
+                enc = buf;
+                while (!enc.empty() && (enc.back() == '\n' || enc.back() == '\r'))
+                    enc.pop_back();
+            }
+            if (enc.empty()) enc = query;  // raw fallback
+            url = "https://music.youtube.com/search?q=" + enc;
+        }
+        shell("xdg-open " + q(url));
+        return query.empty() ? "Playing music." : "Playing " + query + ".";
+    }
     if (action.type == "screenshot") {
         system("grim ~/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png 2>/dev/null");
         return "Screenshot saved.";

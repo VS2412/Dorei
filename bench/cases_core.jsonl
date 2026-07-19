@@ -1,0 +1,42 @@
+# aria-bench core cases. One JSON object per line.
+#   input                — user utterance (text; ASR is benched separately)
+#   expect               — acceptable final action types (see toolToAction in
+#                          llm.cpp + classifyIntent in intent.cpp). EMPTY array
+#                          = the correct behavior is speech with NO tool call.
+#   expect_args_contains — optional substring that must appear in the args JSON.
+# Small-talk traps run against the RAW LLM (the daemon's regex gates are
+# deliberately excluded): they measure whether the model can survive the
+# Phase-5 deletion of those gates.
+#
+# ── intent fast-path coverage (regex layer, no LLM) ──
+{"id":"intent_open_firefox","input":"open firefox","expect":["open"]}
+{"id":"intent_open_youtube","input":"open youtube","expect":["url"]}
+{"id":"intent_volume_up","input":"volume up","expect":["volume"]}
+{"id":"intent_next_track","input":"next track","expect":["media"]}
+{"id":"intent_workspace","input":"switch to workspace 3","expect":["workspace"]}
+{"id":"intent_screenshot","input":"take a screenshot","expect":["screenshot"]}
+{"id":"intent_websearch","input":"search the web for niri window manager","expect":["url","web_search"]}
+{"id":"intent_play_lofi","input":"put on some lofi beats","expect":["music_search","play_music"],"expect_args_contains":"lofi"}
+#
+# ── LLM tool selection (indirect phrasing the regexes can't catch) ──
+{"id":"llm_open_browser_polite","input":"could you get my browser up for me","expect":["open","url","focus_window"]}
+{"id":"llm_disk_space","input":"how much disk space do I have left","expect":["sysinfo","run"]}
+{"id":"llm_battery","input":"what is my battery percentage","expect":["sysinfo","run"]}
+{"id":"llm_timer","input":"set a timer for two minutes","expect":["timer_set"]}
+{"id":"llm_remember","input":"remember that my favorite editor is neovim","expect":["remember"],"expect_args_contains":"neovim"}
+{"id":"llm_recall","input":"what did we say about my project last time","expect":["recall_memory"]}
+{"id":"llm_list_windows","input":"what windows are open right now","expect":["list_windows"]}
+{"id":"llm_see_screen","input":"what am I looking at on my screen","expect":["see_screen","read_screen_text"]}
+{"id":"llm_close_indirect","input":"get rid of this window","expect":["close","window"]}
+{"id":"llm_brightness_indirect","input":"lower the screen brightness a bit","expect":["brightness"]}
+{"id":"llm_multi_step","input":"open my downloads folder and tell me what is inside it","expect":["run","file_list","open","plan"]}
+{"id":"llm_spotify_device","input":"open Spotify on this device, not in the browser","expect":["open","focus_window"]}
+{"id":"llm_ambiguous_delete","input":"delete all my files","expect":["ask"]}
+#
+# ── no-tool traps: correct answer is SPEECH ONLY (historic wrong-tool bugs) ──
+{"id":"trap_ready","input":"you're ready to go!","expect":[]}
+{"id":"trap_running_smooth","input":"everything is running smooth now","expect":[]}
+{"id":"trap_thanks","input":"thank you so much, that was really helpful","expect":[]}
+{"id":"trap_joke","input":"tell me a joke","expect":[]}
+{"id":"trap_opinion","input":"what do you think about arch linux","expect":[]}
+{"id":"trap_greeting","input":"hey there, how is it going","expect":[]}

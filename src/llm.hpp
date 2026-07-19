@@ -94,7 +94,6 @@ private:
     static size_t writeCallback(void*, size_t, size_t, std::string*);
     std::string   post(const std::string& url, const std::string& body);
     LLMResponse   parse(const std::string& raw);
-    std::string   buildSystem(const LLMContext& ctx);
     void          seedHistoryFromMemory();
     nlohmann::json serializeHistory() const;
 
@@ -107,6 +106,14 @@ private:
         std::string thinkBuf;      // partial tag accumulator
         nlohmann::json finalMsg;   // the done:true message for tool calls
         bool hasFinal = false;
+        // From the done:true chunk. NOTE: prompt_eval_count is the TOTAL
+        // prompt token count (not the cache-miss portion — verified against
+        // Ollama 0.31 behavior). The prefix-cache signal is
+        // prompt_eval_duration: ~75ms on a cache-hot identical prefix vs
+        // ~3,000ms cold for a 3.5k-token prompt (measured 2026-07-19).
+        long long promptTokens = -1;
+        long long genTokens    = -1;
+        long long prefillMs    = -1;
     };
     static size_t streamWriteCallback(void* ptr, size_t sz, size_t nmemb, StreamState* state);
     static void   processStreamLine(const std::string& line, StreamState& state);
@@ -114,7 +121,7 @@ private:
 
     LLMResponse postStreaming(const std::string& url, const std::string& body,
                               StreamCallback onDelta);
-    LLMResponse chatStreaming(const nlohmann::json& messages, const LLMContext& ctx,
+    LLMResponse chatStreaming(const nlohmann::json& messages,
                               StreamCallback onDelta);
     void updateHistory(const std::string& userText, const LLMResponse& result,
                        const std::string& userRole = "user");

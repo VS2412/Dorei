@@ -28,11 +28,6 @@ public:
     // Force-drop the (screenHash, question) → answer cache.
     static void clearCache();
 
-    // Kick moondream into Ollama's resident model set in the background so the
-    // first real see_screen call doesn't eat the full model-swap penalty.
-    // Non-blocking; safe to call multiple times.
-    static void prewarm();
-
     // Delete any stale /tmp/aria_vlm_*.png left behind by a crashed prior run.
     // Call once at daemon startup.
     static void cleanupStaleTempFiles();

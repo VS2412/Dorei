@@ -74,7 +74,11 @@ void Config::load() {
     cfg_.whisper_gpu      = false;
     cfg_.always_listen    = false;
 
-    cfg_.vad_mode         = 3;
+    // 2 (was 3) — fvad aggressiveness 0-3. Mode 3 fires on fan hum / clock
+    // ticks, generating sub-second WAVs that Whisper then hallucinates
+    // sentences from. Mode 2 still catches normal speech but is less
+    // trigger-happy on background noise.
+    cfg_.vad_mode         = 2;
     cfg_.max_react_steps  = 5;
     cfg_.llm_timeout_sec  = 60;
     cfg_.volume_step      = 5;

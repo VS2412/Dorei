@@ -66,7 +66,10 @@ private:
     static constexpr int FRAME_MS     = 20;
     static constexpr int FRAME_SAMPLES = RATE * FRAME_MS / 1000; // 320
     static constexpr int ONSET_FRAMES  = 10;   // 200ms of voice to start
-    static constexpr int TRAIL_FRAMES  = 25;  // 500ms of silence to stop
+    // 15×20ms = 300ms of trailing silence ends the utterance. Was 500ms —
+    // this is pure dead air added to every single turn; 300ms still clears
+    // natural mid-sentence pauses (typical inter-word gaps are <200ms).
+    static constexpr int TRAIL_FRAMES  = 15;
     static constexpr int MIN_FRAMES    = 10;  // 200ms minimum utterance
     static constexpr int MAX_FRAMES    = 1000; // 20s hard cap
     static constexpr int PREROLL       = 5;   // frames before onset

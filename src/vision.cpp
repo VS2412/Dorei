@@ -15,7 +15,6 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -138,9 +137,6 @@ void unlinkQuiet(const std::string& path) {
     std::system(cmd.c_str());
 }
 
-// Flag set when we've logged a "VLM unreachable" error so we don't spam.
-std::atomic<bool> g_prewarmInFlight{false};
-
 }  // namespace
 
 void Vision::clearCache() {
@@ -154,55 +150,10 @@ void Vision::cleanupStaleTempFiles() {
     std::system("rm -f /tmp/aria_vlm_*.png 2>/dev/null");
 }
 
-void Vision::prewarm() {
-    // Fire and forget: POST a 1-token generate call to pull moondream into
-    // Ollama's resident set. Ollama handles the load; we just want it warm
-    // before the user asks a vision question.
-    bool expected = false;
-    if (!g_prewarmInFlight.compare_exchange_strong(expected, true)) return;
-
-    std::thread([]() {
-        const auto& cfg = Config::get();
-        CURL* curl = curl_easy_init();
-        if (!curl) { g_prewarmInFlight.store(false); return; }
-
-        json body;
-        body["model"]  = cfg.vlm_model;
-        body["prompt"] = "";
-        body["stream"] = false;
-        body["keep_alive"] = "10m";
-
-        std::string response;
-        auto* headers = curl_slist_append(nullptr, "Content-Type: application/json");
-        std::string url     = cfg.ollama_url + "/api/generate";
-        std::string bodyStr = body.dump();
-
-        curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    bodyStr.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)bodyStr.size());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWrite);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT,       60L);
-
-        auto t0 = clk::steady_clock::now();
-        CURLcode rc = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        auto ms = clk::duration_cast<clk::milliseconds>(
-                      clk::steady_clock::now() - t0).count();
-
-        if (rc != CURLE_OK)
-            Logger::warn("Vision: prewarm (" + cfg.vlm_model +
-                         ") failed: " + curl_easy_strerror(rc));
-        else
-            Logger::info("Vision: prewarmed " + cfg.vlm_model +
-                         " in " + std::to_string(ms) + "ms");
-
-        g_prewarmInFlight.store(false);
-    }).detach();
-}
+// NOTE (Phase 1): prewarm() is gone on purpose. On a 6GB card, pushing
+// moondream into Ollama at startup EVICTED the primary brain and caused the
+// 16-second first turns measured in Phase 0. Vision now runs CPU-pinned
+// (num_gpu:0 below) — first call pays a RAM load, the brain never moves.
 
 Vision::Result Vision::describePng(const std::string& pngPath,
                                    const std::string& question,
@@ -246,6 +197,9 @@ Vision::Result Vision::describePng(const std::string& pngPath,
     body["stream"]     = false;
     body["think"]      = false;
     body["keep_alive"] = "10m";  // keep model resident between nearby calls
+    // CPU-pinned: the VLM must never compete with the primary brain for the
+    // 6GB card (model-class separation — see foundation.md resource governor).
+    body["options"]    = {{"num_gpu", 0}};
     body["messages"]   = json::array({
         {
             {"role",    "user"},

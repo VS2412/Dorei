@@ -215,7 +215,10 @@ std::vector<float> Memory::embed(const std::string& text) const {
     if (!curl) return out;
 
     const std::string url = ollamaUrl_ + "/api/embeddings";
-    json body = { {"model", embedModel_}, {"prompt", text} };
+    // num_gpu:0 — embeddings run per conversation save; letting nomic grab
+    // VRAM can evict the pinned primary brain on the 6GB card.
+    json body = { {"model", embedModel_}, {"prompt", text},
+                  {"options", {{"num_gpu", 0}}} };
     std::string payload = body.dump();
     std::string response;
 

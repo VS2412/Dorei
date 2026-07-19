@@ -3,11 +3,17 @@
 #include <fstream>
 #include <cstdlib>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <csignal>
 #include <regex>
 #include <unistd.h>
 #include <sys/wait.h>
+
+static long long ttsNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // Make text safe for Piper to speak. Piper voices punctuation literally —
 // "tilde slash", "asterisk dot pdf", "backslash open paren" — which destroys
@@ -192,6 +198,7 @@ void TTS::speakSentence(const std::string& text) {
     f.close();
 
     Logger::info("TTS: speaking → " + clean.substr(0, 80));
+    lastSpeakStartMs_.store(ttsNowMs());
 
     // Pipe WAV from piper stdout directly into pw-play — no intermediate file
     std::string cmd =
@@ -201,6 +208,19 @@ void TTS::speakSentence(const std::string& text) {
         " | pw-play - 2>/dev/null";
 
     runAndTrack(cmd);
+    lastEndedMs_.store(ttsNowMs());
+}
+
+long long TTS::msSinceLastSpeech() const {
+    if (speaking_.load()) return 0;
+    long long end = lastEndedMs_.load();
+    if (end == 0) return 1LL << 30;  // never spoken — return "long ago"
+    return ttsNowMs() - end;
+}
+
+bool TTS::wasRecentlySpeaking(long long withinMs) const {
+    if (speaking_.load()) return true;
+    return msSinceLastSpeech() < withinMs;
 }
 
 // ─── Batch API ───
@@ -397,4 +417,6 @@ void TTS::interrupt() {
     // Wait for playback thread to finish
     if (playbackThread_.joinable())
         playbackThread_.join();
+
+    lastEndedMs_.store(ttsNowMs());
 }
